@@ -188,6 +188,49 @@ Write-Result -Rows $rows -Columns @('vmSize', 'osType', 'VMs')
 $total = ($rows | Measure-Object -Property VMs -Sum).Sum
 if ($total) { Write-Note "Total virtual machines in the rows above: $total" }
 
+# ------------------------------------------------------ 2b. where the fleet is
+
+Write-Section 'Virtual machines by subscription' 'Which subscriptions actually hold the fleet. In a large tenant this is how a specific estate is isolated from everything else.'
+
+$rows = Invoke-Graph @'
+Resources
+| where type =~ 'microsoft.compute/virtualmachines'
+| extend diffOption = tostring(properties.storageProfile.osDisk.diffDiskSettings.option)
+| summarize VMs = count(),
+            Ephemeral = countif(isnotempty(diffOption)),
+            Managed = countif(isempty(diffOption)) by subscriptionId
+| order by VMs desc
+| take 20
+'@
+
+Write-Result -Rows $rows -Columns @('subscriptionId', 'VMs', 'Ephemeral', 'Managed')
+
+Write-Note 'Subscription IDs are shown here rather than names because Resource Graph returns the identifier. Map them in the portal - the management group a subscription sits under usually names the estate.'
+
+# ------------------------------------------------------ 2c. operating systems
+
+Write-Section 'Operating system and image source' 'What these machines actually run, and whether they were built from a marketplace image or a curated one.'
+
+$rows = Invoke-Graph @'
+Resources
+| where type =~ 'microsoft.compute/virtualmachines'
+| extend publisher = tostring(properties.storageProfile.imageReference.publisher)
+| extend offer = tostring(properties.storageProfile.imageReference.offer)
+| extend imageSku = tostring(properties.storageProfile.imageReference.sku)
+| extend source = case(isnotempty(tostring(properties.storageProfile.imageReference.communityGalleryImageId)), 'Community gallery',
+                       isnotempty(tostring(properties.storageProfile.imageReference.sharedGalleryImageId)), 'Shared gallery',
+                       isempty(publisher) and isnotempty(tostring(properties.storageProfile.imageReference.id)), 'Custom image or gallery',
+                       isempty(publisher), 'Unknown',
+                       strcat(offer, ' / ', imageSku))
+| summarize VMs = count() by source
+| order by VMs desc
+| take 30
+'@
+
+Write-Result -Rows $rows -Columns @('source', 'VMs')
+
+Write-Note 'A multi-session image usually carries "avd" or "multisession" in the SKU. Anything reading as a custom image or gallery was built from a curated pipeline rather than the marketplace.'
+
 # ------------------------------------------------ 3. ephemeral vs managed OS
 
 Write-Section 'Ephemeral versus managed OS disks' 'Decides whether disk tiering has anything to act on. An ephemeral host has no billed OS disk at all.'
@@ -229,6 +272,28 @@ Resources
 
 Write-Result -Rows $rows -Columns @('powerState', 'VMs') `
     -EmptyMessage 'No power state returned. Resource Graph exposes this through the extended instance view, which is not always populated.'
+
+# --------------------------------------------------- 4b. duty cycle by SKU
+
+Write-Section 'Duty cycle by size' 'Running against stopped, per size. This is the single most useful input to any per-machine cost model.'
+
+$rows = Invoke-Graph @'
+Resources
+| where type =~ 'microsoft.compute/virtualmachines'
+| extend vmSize = tostring(properties.hardwareProfile.vmSize)
+| extend state = tostring(properties.extended.instanceView.powerState.displayStatus)
+| extend running = iff(state =~ 'VM running', 1, 0)
+| summarize Total = count(), Running = sum(running) by vmSize
+| extend Stopped = Total - Running
+| extend RunningPct = round(100.0 * Running / Total, 0)
+| where Total >= 10
+| order by Total desc
+| take 30
+'@
+
+Write-Result -Rows $rows -Columns @('vmSize', 'Total', 'Running', 'Stopped', 'RunningPct')
+
+Write-Note 'This is a single point in time, not an average. Read it alongside the time of day at the top of this report - a morning reading and an afternoon reading tell very different stories.'
 
 # ------------------------------------------------------------- 5. VM regions
 
@@ -290,6 +355,30 @@ Resources
 '@
 
 Write-Result -Rows $rows -Columns @('sizeGB', 'skuName', 'Disks')
+
+# ------------------------------------------------------ 7b. unattached disks
+
+Write-Section 'Unattached disks' 'Disks with no owner still bill in full. Usually the fastest saving available, and it needs no migration.'
+
+$rows = Invoke-Graph @'
+Resources
+| where type =~ 'microsoft.compute/disks'
+| where tostring(properties.diskState) =~ 'Unattached'
+| extend skuName = tostring(sku.name)
+| extend sizeGB = toint(properties.diskSizeGB)
+| summarize Disks = count(), ProvisionedTiB = round(sum(sizeGB) / 1024.0, 1),
+            AvgGB = round(avg(sizeGB), 0) by skuName
+| order by ProvisionedTiB desc
+'@
+
+Write-Result -Rows $rows -Columns @('skuName', 'Disks', 'ProvisionedTiB', 'AvgGB') `
+    -EmptyMessage 'No unattached disks.'
+
+$orphans = ($rows | Measure-Object -Property Disks -Sum).Sum
+$orphanTiB = ($rows | Measure-Object -Property ProvisionedTiB -Sum).Sum
+if ($orphans) {
+    Write-Note "$orphans unattached disk(s) holding $orphanTiB TiB, with nothing using them. Cost it against your own price sheet rather than list pricing."
+}
 
 # ------------------------------------------------------------ 8. AVD estate
 
@@ -361,6 +450,27 @@ Resources
 
 Write-Result -Rows $rows -Columns @('type', 'Count') -EmptyMessage 'No compute gallery or managed image resources visible.'
 
+# ------------------------------------------------------------- 11. snapshots
+
+Write-Section 'Snapshots' 'Snapshot sprawl is a common and invisible cost. They persist long after whatever created them.'
+
+$rows = Invoke-Graph @'
+Resources
+| where type =~ 'microsoft.compute/snapshots'
+| extend skuName = tostring(sku.name)
+| extend sizeGB = toint(properties.diskSizeGB)
+| extend ageDays = datetime_diff('day', now(), todatetime(properties.timeCreated))
+| extend ageBand = case(ageDays < 30, '0 to 30 days',
+                        ageDays < 90, '30 to 90 days',
+                        ageDays < 365, '90 to 365 days',
+                        'over a year')
+| summarize Snapshots = count(), ProvisionedTiB = round(sum(sizeGB) / 1024.0, 1) by ageBand, skuName
+| order by ProvisionedTiB desc
+'@
+
+Write-Result -Rows $rows -Columns @('ageBand', 'skuName', 'Snapshots', 'ProvisionedTiB') `
+    -EmptyMessage 'No snapshots visible.'
+
 # ------------------------------------------------- 11. reservations coverage
 
 Write-Section 'Reservations and savings plans' 'Commitment coverage. A lapsed reservation is a silent price rise.'
@@ -375,27 +485,77 @@ Resources
 Write-Result -Rows $rows -Columns @('type', 'Count') `
     -EmptyMessage 'No capacity resources visible through Resource Graph.'
 
+<#
+    Reservations are billing scoped rather than subscription scoped, so this is
+    a separate call. Az.Reservations is not present in Cloud Shell, so the REST
+    API is used directly with the session's own token. That keeps the script
+    working in the one place it is most likely to be run.
+#>
 try {
-    $res = @(Get-AzReservation -ErrorAction Stop)
-    if ($res.Count -gt 0) {
-        $summary = $res | Group-Object { $_.SkuName }, { $_.ProvisioningState } |
-            ForEach-Object {
-                [pscustomobject]@{
-                    Sku        = $_.Group[0].SkuName
-                    State      = $_.Group[0].ProvisioningState
-                    Quantity   = ($_.Group | Measure-Object -Property Quantity -Sum).Sum
-                    Expiring   = ($_.Group | Sort-Object ExpiryDate | Select-Object -First 1).ExpiryDate
-                }
+    $token = (Get-AzAccessToken -ResourceUrl 'https://management.azure.com/' -ErrorAction Stop)
+    $secure = $token.Token
+    if ($secure -is [System.Security.SecureString]) {
+        $secure = [System.Net.NetworkCredential]::new('', $secure).Password
+    }
+
+    $uri = 'https://management.azure.com/providers/Microsoft.Capacity/reservations?api-version=2022-11-01'
+    $response = Invoke-RestMethod -Uri $uri -Headers @{ Authorization = "Bearer $secure" } -ErrorAction Stop
+
+    $items = @($response.value)
+    if ($items.Count -gt 0) {
+        $summary = $items | ForEach-Object {
+            [pscustomobject]@{
+                Sku      = $_.sku.name
+                Scope    = $_.properties.appliedScopeType
+                State    = $_.properties.provisioningState
+                Quantity = $_.properties.quantity
+                Expires  = if ($_.properties.expiryDate) { $_.properties.expiryDate } else { '' }
             }
-        Write-Result -Rows $summary -Columns @('Sku', 'State', 'Quantity', 'Expiring')
+        } | Group-Object Sku, State | ForEach-Object {
+            [pscustomobject]@{
+                Sku      = $_.Group[0].Sku
+                State    = $_.Group[0].State
+                Scope    = $_.Group[0].Scope
+                Quantity = ($_.Group | Measure-Object -Property Quantity -Sum).Sum
+                Expires  = ($_.Group | Sort-Object Expires | Select-Object -First 1).Expires
+            }
+        }
+        Write-Result -Rows $summary -Columns @('Sku', 'State', 'Scope', 'Quantity', 'Expires')
     }
     else {
-        Write-Note 'No reservations returned. Reservation data needs the Reservation Reader role, which is separate from subscription Reader.'
+        Write-Note 'No reservations returned. Reservation data is billing scoped, so subscription Reader does not cover it - the Reservation Reader role is separate.'
     }
 }
 catch {
     $reason = $_.Exception.Message.TrimEnd('.')
-    Write-Note "Reservation lookup unavailable: $reason. This usually means the Reservation Reader role has not been granted - it is billing scoped, not subscription scoped."
+    Write-Note "Reservation lookup unavailable: $reason. Reservation data is billing scoped rather than subscription scoped, so subscription Reader does not cover it."
+}
+
+# ------------------------------------------------------- 11b. savings plans
+
+try {
+    $uri = 'https://management.azure.com/providers/Microsoft.BillingBenefits/savingsPlans?api-version=2022-11-01'
+    $response = Invoke-RestMethod -Uri $uri -Headers @{ Authorization = "Bearer $secure" } -ErrorAction Stop
+
+    $items = @($response.value)
+    if ($items.Count -gt 0) {
+        $summary = $items | ForEach-Object {
+            [pscustomobject]@{
+                Name    = $_.name
+                Term    = $_.properties.term
+                State   = $_.properties.provisioningState
+                Scope   = $_.properties.appliedScopeType
+                Expires = $_.properties.expiryDateTime
+            }
+        }
+        Write-Result -Rows $summary -Columns @('Name', 'Term', 'State', 'Scope', 'Expires')
+    }
+    else {
+        Write-Note 'No savings plans returned at this scope.'
+    }
+}
+catch {
+    Write-Note 'Savings plan lookup unavailable at this scope.'
 }
 
 # ---------------------------------------------------------------- 12. network
